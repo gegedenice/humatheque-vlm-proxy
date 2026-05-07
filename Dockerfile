@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m appuser
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install -U pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app
+
+EXPOSE 8002
+
+USER appuser
+
+CMD ["sh", "-c", "uvicorn app:app -k uvicorn.workers.UvicornWorker --host 0.0.0.0 --port 8002 --workers 1 --threads 4 --timeout-keep-alive 0"]
