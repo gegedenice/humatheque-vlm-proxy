@@ -520,7 +520,7 @@ async def health():
 async def list_models():
 
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
 
             response = await client.get(
                 f"{MODEL_RUNNER_URL}/v1/models"
@@ -553,7 +553,7 @@ async def chat_completions(request: Request):
     payload["model"] = model_for_runner(payload["model"])
 
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
 
             response = await client.post(
                 f"{MODEL_RUNNER_URL}/v1/chat/completions",
@@ -580,7 +580,7 @@ async def responses(request: Request):
     stream = bool(payload.get("stream", False))
 
     try:
-        async with httpx.AsyncClient(timeout=None) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(
                 f"{MODEL_RUNNER_URL}/v1/chat/completions",
                 json=chat_payload,
