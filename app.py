@@ -2,10 +2,14 @@ import os
 import json
 import time
 import uuid
+import base64
+import binascii
+import io
 import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from PIL import Image
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -21,6 +25,7 @@ MODEL_NAME = os.environ.get(
 )
 
 MODEL_ALIAS = os.environ.get("VLM_ALIAS", "Qwen3-VL-8B-Instruct-GGUF")
+MAX_IMAGE_SIDE = int(os.environ.get("VLM_MAX_IMAGE_SIDE", "1024"))
 
 app = FastAPI(title="Humatheque VLM Proxy")
 RESPONSES_STORE = {}
@@ -75,7 +80,57 @@ def response_content_to_text(content):
     return str(content)
 
 
-def responses_content_to_chat_content(content):
+async def resize_image_to_data_url(image_source):
+    raw_bytes = None
+
+    if image_source.startswith("data:"):
+        header, separator, payload = image_source.partition(",")
+        if separator != ",":
+            raise HTTPException(status_code=400, detail="Invalid data URL for image input.")
+        if ";base64" not in header:
+            raise HTTPException(status_code=400, detail="Only base64 data URLs are supported for image input.")
+        try:
+            raw_bytes = base64.b64decode(payload, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid base64 payload in image data URL.")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.get(image_source)
+            response.raise_for_status()
+            raw_bytes = response.content
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch image URL: {exc}")
+
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unable to decode image input.")
+
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise HTTPException(status_code=400, detail="Invalid image dimensions.")
+
+    if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
+        image.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.Resampling.LANCZOS)
+
+    output_buffer = io.BytesIO()
+    if image.mode in ("RGBA", "LA", "P"):
+        if image.mode == "P":
+            image = image.convert("RGBA")
+        image.save(output_buffer, format="PNG", optimize=True)
+        mime = "image/png"
+    else:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image.save(output_buffer, format="JPEG", quality=85, optimize=True)
+        mime = "image/jpeg"
+
+    encoded = base64.b64encode(output_buffer.getvalue()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+async def responses_content_to_chat_content(content):
     if isinstance(content, str):
         return content
 
@@ -110,14 +165,18 @@ def responses_content_to_chat_content(content):
         elif part_type in {"input_image", "image_url"}:
             image_url = part.get("image_url")
             if isinstance(image_url, str):
+                resized_data_url = await resize_image_to_data_url(image_url)
                 chat_parts.append({
                     "type": "image_url",
-                    "image_url": {"url": image_url}
+                    "image_url": {"url": resized_data_url}
                 })
             elif isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                resized_data_url = await resize_image_to_data_url(image_url["url"])
+                image_url_payload = dict(image_url)
+                image_url_payload["url"] = resized_data_url
                 chat_parts.append({
                     "type": "image_url",
-                    "image_url": image_url
+                    "image_url": image_url_payload
                 })
             else:
                 raise HTTPException(
@@ -136,7 +195,7 @@ def responses_content_to_chat_content(content):
     return chat_parts
 
 
-def responses_input_to_messages(response_input):
+async def responses_input_to_messages(response_input):
     if isinstance(response_input, str):
         return [{"role": "user", "content": response_input}]
 
@@ -174,7 +233,7 @@ def responses_input_to_messages(response_input):
 
         if item_type == "message":
             role = item.get("role", "user")
-            content = responses_content_to_chat_content(item.get("content", ""))
+            content = await responses_content_to_chat_content(item.get("content", ""))
             messages.append({"role": role, "content": content})
             continue
 
@@ -185,7 +244,7 @@ def responses_input_to_messages(response_input):
             )
 
         role = item.get("role", "user")
-        content = responses_content_to_chat_content(item.get("content", ""))
+        content = await responses_content_to_chat_content(item.get("content", ""))
         messages.append({"role": role, "content": content})
 
     return messages
@@ -353,8 +412,8 @@ def validate_response_format(response_format):
             )
 
 
-def make_chat_payload_for_responses(payload, runner_model):
-    chat_messages = responses_input_to_messages(payload.get("input", ""))
+async def make_chat_payload_for_responses(payload, runner_model):
+    chat_messages = await responses_input_to_messages(payload.get("input", ""))
     instructions = payload.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         chat_messages.insert(0, {"role": "system", "content": instructions})
@@ -576,7 +635,7 @@ async def responses(request: Request):
 
     response_model = payload.get("model", MODEL_NAME)
     runner_model = model_for_runner(response_model)
-    chat_payload = make_chat_payload_for_responses(payload, runner_model)
+    chat_payload = await make_chat_payload_for_responses(payload, runner_model)
     stream = bool(payload.get("stream", False))
 
     try:
