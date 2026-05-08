@@ -22,14 +22,27 @@ MODEL_ALIAS = os.environ.get("VLM_ALIAS", "Qwen3-VL-8B-Instruct-GGUF")
 app = FastAPI(title="Humatheque VLM Proxy")
 
 
+def backend_model_candidates(model_name: str) -> set[str]:
+    candidates = {model_name}
+
+    if model_name.startswith("hf.co/"):
+        candidates.add(model_name.replace("hf.co/", "huggingface.co/", 1))
+    elif model_name.startswith("huggingface.co/"):
+        candidates.add(model_name.replace("huggingface.co/", "hf.co/", 1))
+
+    return {candidate.lower() for candidate in candidates}
+
+
 def model_for_runner(model_name: str) -> str:
     if MODEL_ALIAS and model_name == MODEL_ALIAS:
+        return MODEL_NAME
+    if model_name.lower() in backend_model_candidates(MODEL_NAME):
         return MODEL_NAME
     return model_name
 
 
 def model_for_client(model_name: str) -> str:
-    if MODEL_ALIAS and model_name == MODEL_NAME:
+    if MODEL_ALIAS and model_name.lower() in backend_model_candidates(MODEL_NAME):
         return MODEL_ALIAS
     return model_name
 
