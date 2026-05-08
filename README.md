@@ -6,9 +6,6 @@ It supports:
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
-- `POST /v1/responses` (OpenAI Responses-like route)
-- `GET /v1/responses/{response_id}`
-- `DELETE /v1/responses/{response_id}`
 
 ## 1) Start the backend model
 
@@ -66,27 +63,56 @@ curl -X POST http://localhost:8002/v1/chat/completions \
   }'
 ```
 
-### Responses API-like route
+### Chat Completions With Image Input
 
 ```bash
-curl -X POST http://localhost:8002/v1/responses \
+curl -X POST http://localhost:8002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen3-VL-8B-Instruct-GGUF",
-    "input": [
+    "messages": [
       {
-        "type": "message",
         "role": "user",
         "content": [
-          {"type":"input_text","text":"Describe this image briefly"},
-          {"type":"input_image","image_url":"https://example.com/image.jpg"}
+          {"type":"text","text":"Describe this image briefly"},
+          {"type":"image_url","image_url":{"url":"https://example.com/image.jpg"}}
         ]
       }
     ]
   }'
 ```
 
+### Chat Completions With Tools
+
+```bash
+curl -X POST http://localhost:8002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-VL-8B-Instruct-GGUF",
+    "messages": [
+      {"role":"user","content":"Search the catalog for manuscripts about optics"}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "search_catalog",
+          "description": "Search the library catalog.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {"type": "string"}
+            },
+            "required": ["query"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }'
+```
+
 ## Notes
 
-- `POST /v1/responses` includes support for tool-calling style loops (`tools`, `tool_choice`, `function_call_output`, `previous_response_id`).
-- Response IDs are stored in-memory for `GET`/`DELETE` routes (data is lost on process restart).
+- `POST /v1/chat/completions` forwards OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool-result messages to the backend.
+- Image URLs and base64 data URLs in message content are resized to `VLM_MAX_IMAGE_SIDE` before being forwarded.
