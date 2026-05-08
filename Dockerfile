@@ -22,4 +22,4 @@ EXPOSE 8002
 
 USER appuser
 
-CMD ["sh", "-c", "uvicorn app:app -k uvicorn.workers.UvicornWorker --host 0.0.0.0 --port 8002 --workers 1 --threads 4 --timeout-keep-alive 0"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 8002 --workers 1 --threads 4 --timeout-keep-alive 0"]
