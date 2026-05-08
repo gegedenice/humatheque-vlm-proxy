@@ -17,7 +17,21 @@ MODEL_NAME = os.environ.get(
     "hf.co/unsloth/Qwen3-VL-8B-Instruct-GGUF:UD-Q4_K_XL"
 )
 
+MODEL_ALIAS = os.environ.get("VLM_ALIAS", "Qwen3-VL-8B-Instruct-GGUF")
+
 app = FastAPI(title="Humatheque VLM Proxy")
+
+
+def model_for_runner(model_name: str) -> str:
+    if MODEL_ALIAS and model_name == MODEL_ALIAS:
+        return MODEL_NAME
+    return model_name
+
+
+def model_for_client(model_name: str) -> str:
+    if MODEL_ALIAS and model_name == MODEL_NAME:
+        return MODEL_ALIAS
+    return model_name
 
 
 @app.get("/health")
@@ -50,9 +64,17 @@ async def list_models():
                 f"{MODEL_RUNNER_URL}/v1/models"
             )
 
+        content = response.json()
+        if isinstance(content, dict):
+            models = content.get("data")
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict) and "id" in model:
+                        model["id"] = model_for_client(model["id"])
+
         return JSONResponse(
             status_code=response.status_code,
-            content=response.json()
+            content=content
         )
 
     except Exception as e:
@@ -66,6 +88,7 @@ async def chat_completions(request: Request):
 
     # inject model automatically if missing
     payload.setdefault("model", MODEL_NAME)
+    payload["model"] = model_for_runner(payload["model"])
 
     try:
         async with httpx.AsyncClient(timeout=None) as client:
