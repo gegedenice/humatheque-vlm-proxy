@@ -29,6 +29,28 @@ MAX_IMAGE_SIDE = int(os.environ.get("VLM_MAX_IMAGE_SIDE", "1024"))
 
 app = FastAPI(title="Humatheque VLM Proxy")
 RESPONSES_STORE = {}
+RESPONSES_CHAT_HISTORY = {}
+
+
+def json_or_error_response(response, upstream_name="model_runner"):
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        message = response.text.strip() or response.reason_phrase
+        return {
+            "error": {
+                "message": message,
+                "type": f"{upstream_name}_error",
+                "status_code": response.status_code
+            }
+        }
+
+
+async def request_json(request: Request):
+    try:
+        return await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {exc}")
 
 
 def backend_model_candidates(model_name: str) -> set[str]:
@@ -78,6 +100,16 @@ def response_content_to_text(content):
         return json.dumps(content)
 
     return str(content)
+
+
+def ensure_json_string(value, default="{}"):
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return json.dumps(value)
+    return str(value)
 
 
 async def resize_image_to_data_url(image_source):
@@ -159,11 +191,11 @@ async def responses_content_to_chat_content(content):
                 raise HTTPException(
                     status_code=400,
                     detail=f"content[{index}].text must be a string."
-                )
+            )
             chat_parts.append({"type": "text", "text": text})
 
         elif part_type in {"input_image", "image_url"}:
-            image_url = part.get("image_url")
+            image_url = part.get("image_url") or part.get("url")
             if isinstance(image_url, str):
                 resized_data_url = await resize_image_to_data_url(image_url)
                 chat_parts.append({
@@ -231,6 +263,27 @@ async def responses_input_to_messages(response_input):
             })
             continue
 
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="function_call requires a non-empty call_id."
+                )
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": ensure_json_string(item.get("arguments"))
+                    }
+                }]
+            })
+            continue
+
         if item_type == "message":
             role = item.get("role", "user")
             content = await responses_content_to_chat_content(item.get("content", ""))
@@ -251,10 +304,15 @@ async def responses_input_to_messages(response_input):
 
 
 def chat_completion_to_response(chat_completion, model_name):
+    if not isinstance(chat_completion, dict):
+        raise HTTPException(status_code=502, detail="Model runner returned an invalid chat completion body.")
+
     choices = chat_completion.get("choices", [])
     first_choice = choices[0] if choices else {}
     message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
     content = message.get("content", "") if isinstance(message, dict) else ""
+    if not isinstance(content, str):
+        content = response_content_to_text(content)
     role = message.get("role", "assistant") if isinstance(message, dict) else "assistant"
 
     usage = chat_completion.get("usage", {}) if isinstance(chat_completion, dict) else {}
@@ -267,12 +325,14 @@ def chat_completion_to_response(chat_completion, model_name):
             if not isinstance(tool_call, dict):
                 continue
             function = tool_call.get("function", {})
+            if not isinstance(function, dict):
+                function = {}
             output.append({
                 "id": f"fc_{uuid.uuid4().hex}",
                 "type": "function_call",
                 "call_id": tool_call.get("id", f"call_{uuid.uuid4().hex}"),
                 "name": function.get("name", ""),
-                "arguments": function.get("arguments", "{}"),
+                "arguments": ensure_json_string(function.get("arguments")),
                 "status": "completed"
             })
 
@@ -327,8 +387,9 @@ def response_output_to_messages(response_obj):
     if not isinstance(output_items, list):
         return []
 
-    messages = []
-    pending_tool_calls = []
+    text_parts = []
+    tool_calls = []
+    role = "assistant"
 
     for item in output_items:
         if not isinstance(item, dict):
@@ -337,32 +398,38 @@ def response_output_to_messages(response_obj):
         item_type = item.get("type")
 
         if item_type == "message":
-            role = item.get("role", "assistant")
+            role = item.get("role", role)
             content = response_content_to_text(item.get("content", []))
-            messages.append({"role": role, "content": content})
+            if content:
+                text_parts.append(content)
 
         elif item_type == "function_call":
-            pending_tool_calls.append({
+            tool_calls.append({
                 "id": item.get("call_id", f"call_{uuid.uuid4().hex}"),
                 "type": "function",
                 "function": {
                     "name": item.get("name", ""),
-                    "arguments": item.get("arguments", "{}")
+                    "arguments": ensure_json_string(item.get("arguments"))
                 }
             })
 
-    if pending_tool_calls:
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": pending_tool_calls
-        })
+    if not text_parts and not tool_calls:
+        return []
 
-    return messages
+    message = {
+        "role": role,
+        "content": "\n".join(text_parts)
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    return [message]
 
 
 def normalize_responses_tool_choice(tool_choice):
     if isinstance(tool_choice, str):
+        if tool_choice in {"none", "auto", "required"}:
+            return tool_choice
         return tool_choice
 
     if not isinstance(tool_choice, dict):
@@ -385,6 +452,45 @@ def normalize_responses_tool_choice(tool_choice):
         }
 
     return tool_choice
+
+
+def normalize_responses_tool(tool):
+    if not isinstance(tool, dict):
+        return None
+
+    if tool.get("type") != "function":
+        return None
+
+    if isinstance(tool.get("function"), dict):
+        function = tool["function"]
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {"type": "object", "properties": {}})
+            }
+        }
+
+    name = tool.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}}
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": tool.get("description", ""),
+            "parameters": parameters
+        }
+    }
 
 
 def validate_response_format(response_format):
@@ -425,10 +531,13 @@ async def make_chat_payload_for_responses(payload, runner_model):
 
     previous_response_id = payload.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
-        previous_response = RESPONSES_STORE.get(previous_response_id)
-        if previous_response is None:
+        previous_messages = RESPONSES_CHAT_HISTORY.get(previous_response_id)
+        if previous_messages is None:
+            previous_response = RESPONSES_STORE.get(previous_response_id)
+            if previous_response is not None:
+                previous_messages = response_output_to_messages(previous_response)
+        if previous_messages is None:
             raise HTTPException(status_code=404, detail="previous_response_id not found")
-        previous_messages = response_output_to_messages(previous_response)
         chat_payload["messages"] = previous_messages + chat_payload["messages"]
 
     passthrough_fields = [
@@ -444,37 +553,28 @@ async def make_chat_payload_for_responses(payload, runner_model):
         if field in payload:
             chat_payload[field] = payload[field]
 
+    if "max_output_tokens" in payload and "max_tokens" not in chat_payload:
+        chat_payload["max_tokens"] = payload["max_output_tokens"]
+
     tools = payload.get("tools")
     if isinstance(tools, list):
         chat_tools = []
         for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            if tool.get("type") == "function" and isinstance(tool.get("name"), str):
-                chat_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.get("name"),
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", {"type": "object", "properties": {}})
-                    }
-                })
-            elif tool.get("type") == "function" and isinstance(tool.get("function"), dict):
-                chat_tools.append(tool)
+            chat_tool = normalize_responses_tool(tool)
+            if chat_tool is not None:
+                chat_tools.append(chat_tool)
         if chat_tools:
             chat_payload["tools"] = chat_tools
 
     tool_choice = normalize_responses_tool_choice(payload.get("tool_choice"))
-    if tool_choice is not None:
+    if tool_choice is not None and chat_payload.get("tools"):
         chat_payload["tool_choice"] = tool_choice
-
-    if "parallel_tool_calls" in payload:
-        chat_payload["parallel_tool_calls"] = payload["parallel_tool_calls"]
 
     response_format = payload.get("response_format")
     if isinstance(response_format, dict):
         validate_response_format(response_format)
-        chat_payload["response_format"] = response_format
+        if response_format.get("type") != "text":
+            chat_payload["response_format"] = response_format
 
     text_config = payload.get("text")
     if isinstance(text_config, dict):
@@ -501,8 +601,7 @@ async def make_chat_payload_for_responses(payload, runner_model):
                 chat_payload["response_format"] = {"type": "json_object"}
                 validate_response_format(chat_payload["response_format"])
             elif format_type == "text":
-                chat_payload["response_format"] = {"type": "text"}
-                validate_response_format(chat_payload["response_format"])
+                pass
             else:
                 raise HTTPException(
                     status_code=400,
@@ -585,12 +684,12 @@ async def list_models():
                 f"{MODEL_RUNNER_URL}/v1/models"
             )
 
-        content = response.json()
+        content = json_or_error_response(response)
         if isinstance(content, dict):
             models = content.get("data")
             if isinstance(models, list):
                 for model in models:
-                    if isinstance(model, dict) and "id" in model:
+                    if isinstance(model, dict) and isinstance(model.get("id"), str):
                         model["id"] = model_for_client(model["id"])
 
         return JSONResponse(
@@ -605,10 +704,14 @@ async def list_models():
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
 
-    payload = await request.json()
+    payload = await request_json(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
 
     # inject model automatically if missing
     payload.setdefault("model", MODEL_NAME)
+    if not isinstance(payload["model"], str):
+        raise HTTPException(status_code=400, detail="model must be a string.")
     payload["model"] = model_for_runner(payload["model"])
 
     try:
@@ -621,7 +724,7 @@ async def chat_completions(request: Request):
 
         return JSONResponse(
             status_code=response.status_code,
-            content=response.json()
+            content=json_or_error_response(response)
         )
 
     except Exception as e:
@@ -631,9 +734,13 @@ async def chat_completions(request: Request):
 @app.post("/v1/responses")
 async def responses(request: Request):
 
-    payload = await request.json()
+    payload = await request_json(request)
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
 
     response_model = payload.get("model", MODEL_NAME)
+    if not isinstance(response_model, str):
+        raise HTTPException(status_code=400, detail="model must be a string.")
     runner_model = model_for_runner(response_model)
     chat_payload = await make_chat_payload_for_responses(payload, runner_model)
     stream = bool(payload.get("stream", False))
@@ -645,13 +752,16 @@ async def responses(request: Request):
                 json=chat_payload,
             )
 
-        content = response.json()
+        content = json_or_error_response(response)
         if response.status_code >= 400:
             return JSONResponse(status_code=response.status_code, content=content)
 
         response_obj = chat_completion_to_response(content, response_model)
         if payload.get("store", True) is not False:
             RESPONSES_STORE[response_obj["id"]] = response_obj
+            RESPONSES_CHAT_HISTORY[response_obj["id"]] = (
+                chat_payload["messages"] + response_output_to_messages(response_obj)
+            )
 
         if stream:
             return StreamingResponse(
@@ -681,6 +791,7 @@ async def get_response(response_id: str):
 async def delete_response(response_id: str):
 
     response_obj = RESPONSES_STORE.pop(response_id, None)
+    RESPONSES_CHAT_HISTORY.pop(response_id, None)
     if response_obj is None:
         raise HTTPException(status_code=404, detail="Response not found")
 
